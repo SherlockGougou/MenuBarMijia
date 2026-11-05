@@ -8,7 +8,6 @@ public struct ControlCenterPanel: View {
     @AppStorage(PanelPrefs.climatePanelKey) var climatePanelModule: Bool = true
     @AppStorage(DeviceLayoutPrefs.storageKey) var tileSizesRaw: String = "{}"
     @AppStorage(DeviceLayoutPrefs.orderKey) var orderRaw: String = "[]"
-    @State var isEditingLayout = false
     @State var draggingId: String?
     @State var activeResize: ActiveTileResize?
     // In-memory mirrors of the saved order/sizes: @AppStorage publishes changes outside the
@@ -32,16 +31,10 @@ public struct ControlCenterPanel: View {
     // #146: room aliases and order, separate from device prefs so a room rename never touches devices.
     @AppStorage(RoomPrefs.aliasesKey) var roomAliasesRaw: String = "{}"
     @AppStorage(RoomPrefs.orderKey) var roomOrderRaw: String = "[]"
-    @State var isEditingRooms = false
-    @State var draggingRoomId: String?
-    @State var roomDragLocation: CGPoint?
-    @State var roomGrabOffset: CGFloat = 0
-    @State var roomFrames: [String: CGRect] = [:]
-    @State var lastRoomSwapAt: Date = .distantPast
-    @State var lastRoomSwapTarget: String?
-    @State var roomPressTask: Task<Void, Never>?
-    @State var roomPressCancelled = false
     @State var layoutUI = LayoutUIState.shared
+    /// In-memory mirror of a just-committed room order: `@AppStorage` publishes a moment later, so
+    /// reading only it would show the pre-session order for one frame (§6.3).
+    @State var liveRoomOrder: [String]?
     /// #60: type-to-search. The query lives outside `@State` because the app-wide key monitor
     /// (`PanelSearchKeyboard`) has to read and write it before AppKit dispatches the event.
     @State var search = PanelSearchState.shared
@@ -58,6 +51,12 @@ public struct ControlCenterPanel: View {
 
     /// Card sizes are remembered per page: a room id, or "all" for the overview.
     var layoutScope: String { store.selectedRoomId ?? "all" }
+    /// #146: the panel's edit state lives in one shared mode, so the key monitor and every view read
+    /// the same value. `isEditingLayout` stays the name the card/panel modifiers already use.
+    var isEditingLayout: Bool { layoutUI.editMode == .deviceLayout }
+    var isRoomOrdering: Bool { layoutUI.editMode == .roomOrder }
+    /// Either edit mode: cards and room pills stop hit-testing while one is active.
+    var isEditing: Bool { layoutUI.editMode != .none }
     @AppStorage(PanelHeight.storageKey) private var panelHeightRaw: String = PanelHeight.standard.rawValue
     @AppStorage(AppAppearance.storageKey) private var appearanceRaw: String = AppAppearance.system.rawValue
     @Namespace private var roomPillNamespace
@@ -132,8 +131,7 @@ public struct ControlCenterPanel: View {
             layoutUI.isEditingLayoutRequested = false
             withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
                 store.expandedDeviceId = nil
-                isEditingRooms = false
-                isEditingLayout = true
+                layoutUI.beginDeviceLayoutEditing()
             }
         }
         // Room preferences survive a room disappearing; only the open prompt cannot.
@@ -141,7 +139,14 @@ public struct ControlCenterPanel: View {
             if let rid = layoutUI.renamingRoomId, !ids.contains(rid) {
                 layoutUI.renamingRoomId = nil
             }
+            // A room arriving or leaving mid-session joins the list at the end / keeps its slot.
+            if isRoomOrdering { layoutUI.updateRoomOrderDraft(rooms: store.rooms) { _ in } }
         }
+        // Another home or account brings another room set: a draft must never cross that boundary.
+        .onChange(of: store.selectedMiHomeId) { _, _ in layoutUI.commitRoomOrderIfNeeded() }
+        .onChange(of: store.homeBackend) { _, _ in layoutUI.commitRoomOrderIfNeeded() }
+        // The saved key caught up with the commit (or something else rewrote it): drop the mirror.
+        .onChange(of: roomOrderRaw) { _, _ in liveRoomOrder = nil }
         .frame(width: Self.panelWidth, height: panelHeight)
         .onChange(of: panelHeightRaw) { _, _ in syncMenuBarWindowSize() }
         .onChange(of: store.lastAssistantActionAt) { _, date in
@@ -187,9 +192,7 @@ public struct ControlCenterPanel: View {
         .onChange(of: search.isSearching) { _, searching in
             if searching {
                 // The query bar replaces the room strip; reordering underneath it would be invisible.
-                isEditingRooms = false
-                draggingRoomId = nil
-                roomDragLocation = nil
+                layoutUI.commitRoomOrderIfNeeded()
             } else {
                 isSearchFieldFocused = false
             }
@@ -224,7 +227,8 @@ public struct ControlCenterPanel: View {
 
             // #180 review: after connecting, the lessons stay above the dashboard so search and
             // All Off/Undo can be tried while these instructions are still on screen.
-            if store.showsOnboardingChecklistCard {
+            // Reordering wants the height for the list instead (§5.1).
+            if store.showsOnboardingChecklistCard, !isRoomOrdering {
                 OnboardingChecklistCard(
                     store: store,
                     onBeginSearch: { withAnimation(AppleMotion.snappySpring) { search.begin() } }
@@ -255,7 +259,7 @@ public struct ControlCenterPanel: View {
                     .transition(AppleMotion.drawerTransition)
             }
 
-            if store.showQuickActionsBar {
+            if store.showQuickActionsBar, !isRoomOrdering {
                 quickActionsAndScenesBar
                     .padding(.horizontal, 14)
                     .padding(.bottom, 8)
@@ -264,11 +268,18 @@ public struct ControlCenterPanel: View {
 
             // #60: while a search is open the query bar replaces the room pills, so the empty-query
             // layout is untouched and results are not silently narrowed by the selected room.
+            // #146: sorting keeps the room strip as a live preview, but drops the kind-filter row.
             if search.isSearching {
                 searchBar
                     .padding(.horizontal, 14)
                     .padding(.bottom, 8)
                     .transition(AppleMotion.drawerTransition)
+            } else if isRoomOrdering {
+                if showsRoomStripPreview {
+                    roomFilterBar
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 8)
+                }
             } else {
                 listFilterBars
                     .padding(.horizontal, 14)
@@ -278,6 +289,32 @@ public struct ControlCenterPanel: View {
             Divider()
                 .overlay(Color.primary.opacity(0.07))
 
+            if isRoomOrdering {
+                // The order list replaces the whole scrolling dashboard: one vertical scroll only,
+                // and no tile frames or tile drag gesture mounted underneath (§5.1).
+                RoomOrderEditor(store: store)
+                    .frame(maxHeight: .infinity)
+            } else {
+                deviceGrid
+                    .frame(maxHeight: .infinity)
+            }
+
+            Divider()
+                .overlay(Color.primary.opacity(0.07))
+
+            footerBar
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+        }
+        .animation(AppleMotion.snappySpring, value: store.isShowingAssistantBar)
+        .animation(AppleMotion.snappySpring, value: layoutUI.editMode)
+    }
+
+    /// The 460 pt panel gives the height to the list instead of a strip that duplicates it (§5.1).
+    var showsRoomStripPreview: Bool { panelHeight > PanelHeight.compact.points }
+
+    private var deviceGrid: some View {
+        Group {
             ScrollViewReader { scrollProxy in
                 ScrollView(.vertical, showsIndicators: false) {
                     let sections = pageSections
@@ -331,16 +368,7 @@ public struct ControlCenterPanel: View {
                     }
                 }
             }
-            .frame(maxHeight: .infinity)
-
-            Divider()
-                .overlay(Color.primary.opacity(0.07))
-
-            footerBar
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
         }
-        .animation(AppleMotion.snappySpring, value: store.isShowingAssistantBar)
     }
 
     // MARK: - Search (#60)
@@ -689,25 +717,6 @@ enum PanelSearchKeyboard {
         store.presentAssistantBar()
         Task { @MainActor in
             await store.runAssistantCommand(utterance)
-        }
-    }
-}
-
-/// iOS-style jiggle for room pills in edit mode (#146), phase-shifted per room so neighbours do
-/// not swing in sync. Reduce Motion keeps the strip still.
-struct RoomPillJiggle: ViewModifier {
-    @Environment(\.effectiveReduceMotion) private var reduceMotion
-    let active: Bool
-    let phase: Double
-
-    func body(content: Content) -> some View {
-        if active, !reduceMotion {
-            TimelineView(.animation) { context in
-                let t = context.date.timeIntervalSinceReferenceDate
-                content.rotationEffect(.degrees(sin(t * 2 * .pi * 3.2 + phase) * 0.9))
-            }
-        } else {
-            content
         }
     }
 }
