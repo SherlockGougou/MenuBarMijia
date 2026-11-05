@@ -74,7 +74,47 @@ public struct ControlCenterPanel: View {
     }
     public var body: some View {
         let _ = (store.effectiveLanguage, store.selectedRoomId, store.rooms.count)
-        ZStack(alignment: .bottom) {
+        return dashboardRoot
+            .frame(width: Self.panelWidth, height: panelHeight)
+            .onChange(of: panelHeightRaw) { _, _ in syncMenuBarWindowSize() }
+            .onChange(of: store.lastAssistantActionAt) { _, date in
+                UndoAvailabilityTracker.shared.syncAction(at: date)
+            }
+            .onChange(of: store.assistantState) { _, state in handleAssistantState(state) }
+            // #45: the only place that sees every error toast is the panel root.
+            .onChange(of: store.toastNotice?.id) { _, _ in handleToastNotice() }
+            // Frequently opened utility: show immediately, including keyboard invocation.
+            .onReceive(NotificationCenter.default.publisher(for: MenuBarPanelController.didShowNotification)) { _ in
+                UndoAvailabilityTracker.shared.syncAction(at: store.lastAssistantActionAt)
+                LaunchAtLoginCoordinator.live(store: store).refresh()
+                isPresented = true
+            }
+            .onAppear { handlePanelAppear() }
+            // The panel tree survives a close, so a half-typed query would come back on the next open.
+            .onReceive(NotificationCenter.default.publisher(for: MenuBarPanelController.didHideNotification)) { _ in
+                handlePanelDidHide()
+            }
+            // Leaving search puts the caret back on the panel, so Esc closes it instead of resigning the field.
+            .onChange(of: search.isSearching) { _, searching in handleSearching(searching) }
+            // #180: typing a query — through the key monitor or the field — ticks the guide's search step.
+            .onChange(of: search.query) { _, query in handleSearchQuery(query) }
+            // Mi cloud polls every 6 s only while the panel is on screen (#26).
+            .onChange(of: isPresented) { _, visible in store.setPanelVisible(visible) }
+            .onDisappear { store.setPanelVisible(false) }
+            .transaction { if reduceMotion { $0.disablesAnimations = true } }
+            .environment(\.isEditingLayout, isEditingLayout)
+            .panelRoot()
+            .task {
+                await store.checkForUpdatesIfNeeded()
+            }
+    }
+
+    /// The dashboard plus the hooks that only react to state the panel itself owns. Kept out of
+    /// `body` on purpose: one 30-modifier chain made CI's compiler give up with "unable to
+    /// type-check this expression in reasonable time", so the chain is split in two.
+    private var dashboardRoot: some View {
+        let _ = (store.effectiveLanguage, store.selectedRoomId, store.rooms.count)
+        return ZStack(alignment: .bottom) {
             if store.showsFullOnboardingGuide {
                 OnboardingGuideView(store: store)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -135,81 +175,70 @@ public struct ControlCenterPanel: View {
             }
         }
         // Room preferences survive a room disappearing; only the open prompt cannot.
-        .onChange(of: store.rooms.map(\.id)) { _, ids in
-            if let rid = layoutUI.renamingRoomId, !ids.contains(rid) {
-                layoutUI.renamingRoomId = nil
-            }
-            // A room arriving or leaving mid-session joins the list at the end / keeps its slot.
-            if isRoomOrdering { layoutUI.updateRoomOrderDraft(rooms: store.rooms) { _ in } }
-        }
+        .onChange(of: store.rooms.map(\.id)) { _, ids in handleRoomIds(ids) }
         // Another home or account brings another room set: a draft must never cross that boundary.
         .onChange(of: store.selectedMiHomeId) { _, _ in layoutUI.commitRoomOrderIfNeeded() }
         .onChange(of: store.homeBackend) { _, _ in layoutUI.commitRoomOrderIfNeeded() }
         // The saved key caught up with the commit (or something else rewrote it): drop the mirror.
         .onChange(of: roomOrderRaw) { _, _ in liveRoomOrder = nil }
-        .frame(width: Self.panelWidth, height: panelHeight)
-        .onChange(of: panelHeightRaw) { _, _ in syncMenuBarWindowSize() }
-        .onChange(of: store.lastAssistantActionAt) { _, date in
-            UndoAvailabilityTracker.shared.syncAction(at: date)
+    }
+
+    // MARK: - Body hooks
+    //
+    // The handlers live here rather than inline: closures with control flow inside the panel's long
+    // modifier chain are what pushed CI's type checker over its limit.
+
+    private func handleAssistantState(_ state: AssistantState) {
+        switch state {
+        case .done:
+            SoundFeedback.playSuccess()
+        case .failed:
+            SoundFeedback.playFailure()
+        default:
+            break
         }
-        .onChange(of: store.assistantState) { _, state in
-            switch state {
-            case .done:
-                SoundFeedback.playSuccess()
-            case .failed:
-                SoundFeedback.playFailure()
-            default:
-                break
-            }
+    }
+
+    private func handleToastNotice() {
+        AppDiagnosticsLog.shared.record(store.toastNotice)
+        // #54: failures get an audible cue when the user opted into feedback sounds.
+        if store.toastNotice?.isError == true {
+            SoundFeedback.playFailure()
         }
-        // #45: the only place that sees every error toast is the panel root.
-        .onChange(of: store.toastNotice?.id) { _, _ in
-            AppDiagnosticsLog.shared.record(store.toastNotice)
-            // #54: failures get an audible cue when the user opted into feedback sounds.
-            if store.toastNotice?.isError == true {
-                SoundFeedback.playFailure()
-            }
-        }
-        // Frequently opened utility: show immediately, including keyboard invocation.
-        .onReceive(NotificationCenter.default.publisher(for: MenuBarPanelController.didShowNotification)) { _ in
-            UndoAvailabilityTracker.shared.syncAction(at: store.lastAssistantActionAt)
-            LaunchAtLoginCoordinator.live(store: store).refresh()
-            isPresented = true
-        }
-        .onAppear {
-            UndoAvailabilityTracker.shared.syncAction(at: store.lastAssistantActionAt)
-            SettingsWindowOpener.shared.open = { openSettings() }
-            syncMenuBarWindowSize()
-            isPresented = true
-        }
-        // The panel tree survives a close, so a half-typed query would come back on the next open.
-        .onReceive(NotificationCenter.default.publisher(for: MenuBarPanelController.didHideNotification)) { _ in
-            isPresented = false
-            search.end()
+    }
+
+    private func handlePanelAppear() {
+        UndoAvailabilityTracker.shared.syncAction(at: store.lastAssistantActionAt)
+        SettingsWindowOpener.shared.open = { openSettings() }
+        syncMenuBarWindowSize()
+        isPresented = true
+    }
+
+    private func handlePanelDidHide() {
+        isPresented = false
+        search.end()
+        isSearchFieldFocused = false
+    }
+
+    private func handleSearching(_ searching: Bool) {
+        if searching {
+            // The query bar replaces the room strip; reordering underneath it would be invisible.
+            layoutUI.commitRoomOrderIfNeeded()
+        } else {
             isSearchFieldFocused = false
         }
-        // Leaving search puts the caret back on the panel, so Esc closes it instead of resigning the field.
-        .onChange(of: search.isSearching) { _, searching in
-            if searching {
-                // The query bar replaces the room strip; reordering underneath it would be invisible.
-                layoutUI.commitRoomOrderIfNeeded()
-            } else {
-                isSearchFieldFocused = false
-            }
+    }
+
+    private func handleSearchQuery(_ query: String) {
+        if !query.isEmpty { store.recordOnboardingMilestone(.searchedDevice) }
+    }
+
+    private func handleRoomIds(_ ids: [String]) {
+        if let rid = layoutUI.renamingRoomId, !ids.contains(rid) {
+            layoutUI.renamingRoomId = nil
         }
-        // #180: typing a query — through the key monitor or the field — ticks the guide's search step.
-        .onChange(of: search.query) { _, query in
-            if !query.isEmpty { store.recordOnboardingMilestone(.searchedDevice) }
-        }
-        // Mi cloud polls every 6 s only while the panel is on screen (#26).
-        .onChange(of: isPresented) { _, visible in store.setPanelVisible(visible) }
-        .onDisappear { store.setPanelVisible(false) }
-        .transaction { if reduceMotion { $0.disablesAnimations = true } }
-        .environment(\.isEditingLayout, isEditingLayout)
-        .panelRoot()
-        .task {
-            await store.checkForUpdatesIfNeeded()
-        }
+        // A room arriving or leaving mid-session joins the list at the end / keeps its slot.
+        if isRoomOrdering { layoutUI.updateRoomOrderDraft(rooms: store.rooms) { _ in } }
     }
 
     private func syncMenuBarWindowSize() {
