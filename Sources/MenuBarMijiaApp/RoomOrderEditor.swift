@@ -176,7 +176,6 @@ struct RoomOrderEditor: View {
                             }
                         }
                     )
-                    .id("room_order_content")
                 }
                 .defaultScrollAnchor(.top)
                 .coordinateSpace(name: Self.space)
