@@ -188,9 +188,11 @@ struct RoomOrderEditor: View {
                 )
                 .simultaneousGesture(dragGesture)
                 // ↑/↓ and the VoiceOver moves can land on a row scrolled out of the list: move just
-                // enough to bring it back, never re-center a row that is already visible.
-                .onChange(of: ui.focusedRoomId) { _, focused in
-                    guard let focused else { return }
+                // enough to bring it back, never re-center a row that is already visible. Keyed on the
+                // row's *rank*, not its id: ⌘↑/⌘↓/⌘Home/⌘End move the focused row without changing
+                // `focusedRoomId`, and an id-only hook would keep reordering an invisible row.
+                .onChange(of: focusedRowIndex) { _, _ in
+                    guard let focused = ui.focusedRoomId else { return }
                     withAnimation(motion) { proxy.scrollTo(focused, anchor: nil) }
                 }
             }
@@ -203,6 +205,12 @@ struct RoomOrderEditor: View {
     }
 
     // MARK: Rows
+
+    /// Rank of the focused row, used as the scroll trigger.
+    private var focusedRowIndex: Int? {
+        guard let focused = ui.focusedRoomId else { return nil }
+        return rowDatas().firstIndex { $0.id == focused }
+    }
 
     private func rowDatas() -> [RoomOrderRowData] {
         guard let draft = ui.roomOrderDraft else { return [] }

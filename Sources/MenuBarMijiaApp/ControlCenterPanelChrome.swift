@@ -785,7 +785,8 @@ extension ControlCenterPanel {
             .contentShape(Capsule(style: .continuous))
 
         Group {
-            if roomId == nil || isPreview {
+            // 只有预览态下胶囊不可点；浏览态连「全部」也必须能点，否则选中房间后无法点回全屋视图。
+            if isPreview {
                 content
             } else {
                 Button {
