@@ -17,8 +17,9 @@ enum RoomOrderMetrics {
     static let maxAutoScrollSpeed: CGFloat = 600
     /// A press that travels less than this is a click, not a pick-up: no long press first (§5.4).
     static let dragStartThreshold: CGFloat = 3
-    /// The trailing column the rename button owns: a press there renames instead of dragging (§5.3).
-    static let trailingActionColumn: CGFloat = 46
+    /// The trailing column the 24 pt rename button owns: a press there renames instead of dragging,
+    /// and everything else on the row is a pick-up target (§5.3).
+    static let trailingActionColumn: CGFloat = 30
 
     /// 600 pt/s at the very edge falling linearly to 120 pt/s at the inner end of the band; 0
     /// outside it. Stopping the moment the pointer leaves the band is what keeps a fast drag from
